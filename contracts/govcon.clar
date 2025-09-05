@@ -1,12 +1,22 @@
 ;; Governance contract for managing the blockchain relief fund
 
 ;; =========================================
-;; Metadata
+;; Constants
 ;; =========================================
 
 (define-constant CONTRACT-NAME "ReliefFund Gov")
 (define-constant CONTRACT-VERSION "1.0.0")
 (define-constant CONTRACT-PURPOSE "Disaster relief governance and fund management")
+
+;; Error constants
+(define-constant ERR-UNAUTHORIZED (err u401))
+(define-constant ERR-INVALID-AMOUNT (err u402))
+(define-constant ERR-ALREADY-EXISTS (err u403))
+(define-constant ERR-NOT-FOUND (err u404))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u405))
+(define-constant ERR-CONTRACT-PAUSED (err u406))
+(define-constant ERR-ARITHMETIC-OVERFLOW (err u407))
+(define-constant ERR-INVALID-PARAMETER (err u500))
 
 ;; =========================================
 ;; Data variables
@@ -18,6 +28,8 @@
 (define-data-var required-signatures uint u3)
 (define-data-var tx-nonce uint u0)
 (define-data-var paused bool false)
+(define-data-var donation-counter uint u0)
+(define-data-var withdrawal-counter uint u0)
 
 ;; =========================================
 ;; Maps
@@ -27,11 +39,11 @@
 
 (define-map pending-transactions
   { tx-id: uint }
-  { action: (string-ascii 50), params: (list 10 int), approval-count: uint })
+  { action: (string-ascii 50), params: (list 10 uint), approval-count: uint })
 
 (define-map approvals
   { tx-id: uint, signer: principal }
-  { approved: bool })
+  bool)
 
 (define-map donations
   { donor: principal }
@@ -58,64 +70,100 @@
   { recipient: principal, amount: uint, block: uint })
 
 ;; =========================================
-;; Counters
+;; Helper functions
 ;; =========================================
 
-(define-data-var donation-counter uint u0)
-(define-data-var withdrawal-counter uint u0)
+(define-private (is-admin)
+  (is-eq tx-sender (var-get admin)))
+
+(define-private (is-authorized-signer)
+  (is-some (map-get? signers tx-sender)))
+
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (if (and (>= result a) (>= result b))
+      (ok result)
+      ERR-ARITHMETIC-OVERFLOW)))
+
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b) 
+    (ok (- a b)) 
+    ERR-INSUFFICIENT-BALANCE))
 
 ;; =========================================
-;; Helpers
-;; =========================================
-
-(define-private (uadd (a uint) (b uint)) (+ a b))
-(define-private (usub (a uint) (b uint)) (begin (asserts! (>= a b) (err u407)) (- a b)))
-(define-private (umin (a uint) (b uint)) (if (<= a b) a b))
-(define-private (umax (a uint) (b uint)) (if (>= a b) a b))
-
-;; =========================================
-;; Core functions
+;; Core admin functions
 ;; =========================================
 
 (define-public (set-admin (new-admin principal))
-  (let ((current-admin (var-get admin)))
-    (if (and
-          (is-eq tx-sender current-admin)
-          (not (is-eq new-admin current-admin))
-          (not (is-eq new-admin 'SP000000000000000000002Q6VF78)))
-      (begin
-        (var-set admin new-admin)
-        (ok new-admin))
-      (err u401))))
+  (begin
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (not (is-eq new-admin (var-get admin))) ERR-INVALID-PARAMETER)
+    (asserts! (not (is-eq new-admin 'SP000000000000000000002Q6VF78)) ERR-INVALID-PARAMETER)
+    (var-set admin new-admin)
+    (ok new-admin)))
 
 (define-public (set-min-donation (amount uint))
-  (if (is-eq tx-sender (var-get admin))
-      (if (> amount u0)
-          (begin (var-set min-donation amount) (ok amount))
-          (err u402))
-      (err u401)))
+  (begin
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (var-set min-donation amount)
+    (ok amount)))
 
 (define-public (set-withdrawal-limit (amount uint))
-  (if (is-eq tx-sender (var-get admin))
-      (if (> amount u0)
-          (begin (var-set withdrawal-limit amount) (ok amount))
-          (err u403))
-      (err u401)))
+  (begin
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (var-set withdrawal-limit amount)
+    (ok amount)))
 
-(define-read-only (get-admin) (ok (var-get admin)))
-(define-read-only (get-min-donation) (ok (var-get min-donation)))
-(define-read-only (get-withdrawal-limit) (ok (var-get withdrawal-limit)))
-(define-read-only (is-paused) (ok (var-get paused)))
+(define-public (set-required-signatures (new-required uint))
+  (begin
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (> new-required u0) ERR-INVALID-PARAMETER)
+    (var-set required-signatures new-required)
+    (ok true)))
 
 ;; =========================================
-;; Restrictions for disaster relief
+;; Read-only functions
+;; =========================================
+
+(define-read-only (get-admin) 
+  (var-get admin))
+
+(define-read-only (get-min-donation) 
+  (var-get min-donation))
+
+(define-read-only (get-withdrawal-limit) 
+  (var-get withdrawal-limit))
+
+(define-read-only (is-paused) 
+  (var-get paused))
+
+(define-read-only (get-required-signatures) 
+  (var-get required-signatures))
+
+(define-read-only (get-tx-nonce) 
+  (var-get tx-nonce))
+
+(define-read-only (is-signer (address principal))
+  (is-some (map-get? signers address)))
+
+(define-read-only (get-contract-balance)
+  (stx-get-balance (as-contract tx-sender)))
+
+;; =========================================
+;; Validation functions
 ;; =========================================
 
 (define-public (validate-donation (amount uint))
-  (if (>= amount (var-get min-donation)) (ok true) (err u404)))
+  (if (>= amount (var-get min-donation)) 
+    (ok true) 
+    ERR-INVALID-AMOUNT))
 
 (define-public (validate-withdrawal (amount uint))
-  (if (<= amount (var-get withdrawal-limit)) (ok true) (err u405)))
+  (if (<= amount (var-get withdrawal-limit)) 
+    (ok true) 
+    ERR-INVALID-AMOUNT))
 
 ;; =========================================
 ;; Pause control
@@ -123,13 +171,13 @@
 
 (define-public (pause)
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
     (var-set paused true)
     (ok true)))
 
 (define-public (unpause)
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
     (var-set paused false)
     (ok true)))
 
@@ -139,73 +187,49 @@
 
 (define-public (add-signer (new-signer principal))
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
-    (asserts! (is-none (map-get? signers new-signer)) (err u403))
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (is-none (map-get? signers new-signer)) ERR-ALREADY-EXISTS)
     (map-set signers new-signer true)
     (ok true)))
 
 (define-public (remove-signer (signer principal))
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
-    (asserts! (is-some (map-get? signers signer)) (err u404))
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (is-some (map-get? signers signer)) ERR-NOT-FOUND)
     (map-delete signers signer)
     (ok true)))
 
-(define-public (change-admin (new-admin principal))
-  (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
-    (asserts! (not (is-eq new-admin (var-get admin))) (err u403))
-    (asserts! (not (is-eq new-admin 'SP000000000000000000002Q6VF78)) (err u404))
-    (var-set admin new-admin)
-    (ok true)))
-
-(define-public (propose-transaction (action (string-ascii 50)) (params (list 10 int)))
-  (let ((tx-id (var-get tx-nonce)) (action-length (len action)))
-    (asserts! (is-some (map-get? signers tx-sender)) (err u401))
-    (asserts! (and (> action-length u0) (<= action-length u50)) (err u402))
-    (asserts! (<= (len params) u10) (err u403))
+(define-public (propose-transaction (action (string-ascii 50)) (params (list 10 uint)))
+  (let ((tx-id (var-get tx-nonce)))
+    (asserts! (is-authorized-signer) ERR-UNAUTHORIZED)
+    (asserts! (> (len action) u0) ERR-INVALID-PARAMETER)
+    (asserts! (<= (len action) u50) ERR-INVALID-PARAMETER)
+    (asserts! (<= (len params) u10) ERR-INVALID-PARAMETER)
     (map-set pending-transactions
              { tx-id: tx-id }
              { action: action, params: params, approval-count: u1 })
-    (map-set approvals { tx-id: tx-id, signer: tx-sender } { approved: true })
+    (map-set approvals { tx-id: tx-id, signer: tx-sender } true)
     (var-set tx-nonce (+ tx-id u1))
     (ok tx-id)))
 
 (define-public (approve-transaction (tx-id uint))
-  (let ((tx (unwrap! (map-get? pending-transactions { tx-id: tx-id }) (err u404))))
-    (asserts! (is-some (map-get? signers tx-sender)) (err u401))
-    (let ((already (map-get? approvals { tx-id: tx-id, signer: tx-sender })))
-      (match already
-        approved-entry (err u403)
-        (begin
-          ;; mark this signer as approved
-          (map-set approvals { tx-id: tx-id, signer: tx-sender } { approved: true })
-          ;; increment approval count
-          (let ((curr-count (default-to u0 (get approval-count (map-get? pending-transactions { tx-id: tx-id })))))
-            (map-set pending-transactions { tx-id: tx-id } { action: (get action tx), params: (get params tx), approval-count: (+ curr-count u1) })
-            (let ((new-count (+ curr-count u1)))
-              (if (>= new-count (var-get required-signatures))
-                  (begin
-                    (try! (execute-transaction tx-id))
-                    (ok true))
-                  (ok true)))))))))
+  (let ((tx-data (unwrap! (map-get? pending-transactions { tx-id: tx-id }) ERR-NOT-FOUND)))
+    (asserts! (is-authorized-signer) ERR-UNAUTHORIZED)
+    (asserts! (is-none (map-get? approvals { tx-id: tx-id, signer: tx-sender })) ERR-ALREADY-EXISTS)
+    (map-set approvals { tx-id: tx-id, signer: tx-sender } true)
+    (let ((curr-count (get approval-count tx-data))
+          (new-count (+ curr-count u1)))
+      (map-set pending-transactions 
+               { tx-id: tx-id } 
+               { action: (get action tx-data), 
+                 params: (get params tx-data), 
+                 approval-count: new-count })
+      (if (>= new-count (var-get required-signatures))
+        (execute-transaction tx-id)
+        (ok true)))))
 
 (define-read-only (get-pending-transaction (tx-id uint))
   (map-get? pending-transactions { tx-id: tx-id }))
-
-(define-read-only (get-tx-nonce) (ok (var-get tx-nonce)))
-
-(define-read-only (is-signer (address principal))
-  (is-some (map-get? signers address)))
-
-(define-read-only (get-required-signatures) (ok (var-get required-signatures)))
-
-(define-public (set-required-signatures (new-required uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
-    (asserts! (> new-required u0) (err u403))
-    (var-set required-signatures new-required)
-    (ok true)))
 
 ;; =========================================
 ;; Donation and withdrawal features
@@ -213,38 +237,39 @@
 
 (define-public (donate (amount uint))
   (begin
-    (asserts! (not (var-get paused)) (err u406))
-    (asserts! (>= amount (var-get min-donation)) (err u404))
+    (asserts! (not (var-get paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (>= amount (var-get min-donation)) ERR-INVALID-AMOUNT)
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-    (match (map-get? donations { donor: tx-sender })
-      donor-data
-        (map-set donations { donor: tx-sender } { total-donated: (uadd amount (get total-donated donor-data)) })
-      (map-set donations { donor: tx-sender } { total-donated: amount }))
+    (let ((current-total (default-to u0 (get total-donated (map-get? donations { donor: tx-sender })))))
+      (let ((new-total (unwrap! (safe-add current-total amount) ERR-ARITHMETIC-OVERFLOW)))
+        (map-set donations { donor: tx-sender } { total-donated: new-total })))
     (let ((id (var-get donation-counter)))
-      (map-set donation-history { id: id } { donor: tx-sender, amount: amount, block: block-height })
+      (map-set donation-history { id: id } 
+               { donor: tx-sender, amount: amount, block: block-height })
       (var-set donation-counter (+ id u1)))
     (ok true)))
 
 (define-public (withdraw (recipient principal) (amount uint))
   (begin
-    (asserts! (not (var-get paused)) (err u406))
-    (asserts! (<= amount (var-get withdrawal-limit)) (err u405))
-    (let ((prev (default-to u0 (get total-withdrawn (map-get? withdrawals { recipient: recipient })))))
-      (map-set withdrawals { recipient: recipient } { total-withdrawn: (uadd prev amount) })
-      (try! (stx-transfer? amount (as-contract tx-sender) recipient))
-      (let ((wid (var-get withdrawal-counter)))
-        (map-set withdrawal-history { id: wid } { recipient: recipient, amount: amount, block: block-height })
-        (var-set withdrawal-counter (+ wid u1)))
-      (ok true))))
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (not (var-get paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (<= amount (var-get withdrawal-limit)) ERR-INVALID-AMOUNT)
+    (asserts! (>= (get-contract-balance) amount) ERR-INSUFFICIENT-BALANCE)
+    (let ((prev-total (default-to u0 (get total-withdrawn (map-get? withdrawals { recipient: recipient })))))
+      (let ((new-total (unwrap! (safe-add prev-total amount) ERR-ARITHMETIC-OVERFLOW)))
+        (map-set withdrawals { recipient: recipient } { total-withdrawn: new-total })))
+    (try! (stx-transfer? amount (as-contract tx-sender) recipient))
+    (let ((wid (var-get withdrawal-counter)))
+      (map-set withdrawal-history { id: wid } 
+               { recipient: recipient, amount: amount, block: block-height })
+      (var-set withdrawal-counter (+ wid u1)))
+    (ok true)))
 
 (define-read-only (get-donation (donor principal))
-  (default-to u0 (get total-donated (map-get? donations { donor: donor })) ))
+  (default-to u0 (get total-donated (map-get? donations { donor: donor }))))
 
 (define-read-only (get-withdrawn (recipient principal))
-  (default-to u0 (get total-withdrawn (map-get? withdrawals { recipient: recipient })) ))
-
-(define-read-only (get-contract-balance)
-  (stx-get-balance (as-contract tx-sender)))
+  (default-to u0 (get total-withdrawn (map-get? withdrawals { recipient: recipient }))))
 
 ;; =========================================
 ;; Beneficiaries and allocations
@@ -252,108 +277,133 @@
 
 (define-public (register-beneficiary (account principal))
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
-    (match (map-get? beneficiaries { account: account })
-      b (begin (asserts! (not (get registered b)) (err u403)) (ok false))
-      (begin
-        (map-set beneficiaries { account: account } { registered: true, total-allocated: u0, total-claimed: u0 })
-        (map-set allocations { account: account } { available: u0 })
-        (ok true)))))
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (is-none (map-get? beneficiaries { account: account })) ERR-ALREADY-EXISTS)
+    (map-set beneficiaries { account: account } 
+             { registered: true, total-allocated: u0, total-claimed: u0 })
+    (map-set allocations { account: account } { available: u0 })
+    (ok true)))
 
 (define-public (allocate (account principal) (amount uint))
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u401))
-    (asserts! (not (var-get paused)) (err u406))
-    (let ((b (unwrap! (map-get? beneficiaries { account: account }) (err u404))))
-      (asserts! (get registered b) (err u404))
-      (let ((alloc (default-to u0 (get available (map-get? allocations { account: account })) )))
-        (map-set allocations { account: account } { available: (uadd alloc amount) })
-        (map-set beneficiaries { account: account } { registered: true, total-allocated: (uadd (get total-allocated b) amount), total-claimed: (get total-claimed b) })
-        (ok true)))))
+    (asserts! (is-admin) ERR-UNAUTHORIZED)
+    (asserts! (not (var-get paused)) ERR-CONTRACT-PAUSED)
+    (let ((b (unwrap! (map-get? beneficiaries { account: account }) ERR-NOT-FOUND)))
+      (asserts! (get registered b) ERR-NOT-FOUND)
+      (let ((current-alloc (default-to u0 (get available (map-get? allocations { account: account })))))
+        (let ((new-alloc (unwrap! (safe-add current-alloc amount) ERR-ARITHMETIC-OVERFLOW))
+              (new-total-allocated (unwrap! (safe-add (get total-allocated b) amount) ERR-ARITHMETIC-OVERFLOW)))
+          (map-set allocations { account: account } { available: new-alloc })
+          (map-set beneficiaries { account: account } 
+                   { registered: true, 
+                     total-allocated: new-total-allocated, 
+                     total-claimed: (get total-claimed b) })
+          (ok true))))))
 
 (define-public (beneficiary-withdraw (amount uint))
   (begin
-    (asserts! (not (var-get paused)) (err u406))
-    (let ((b (unwrap! (map-get? beneficiaries { account: tx-sender }) (err u404))))
-      (asserts! (get registered b) (err u404))
-      (let ((alloc (default-to u0 (get available (map-get? allocations { account: tx-sender })) )))
-        (asserts! (<= amount alloc) (err u405))
-        (asserts! (<= amount (var-get withdrawal-limit)) (err u405))
-        (map-set allocations { account: tx-sender } { available: (usub alloc amount) })
-        (map-set beneficiaries { account: tx-sender } { registered: true, total-allocated: (get total-allocated b), total-claimed: (uadd (get total-claimed b) amount) })
-        (try! (stx-transfer? amount (as-contract tx-sender) tx-sender))
-        (let ((wid (var-get withdrawal-counter)))
-          (map-set withdrawal-history { id: wid } { recipient: tx-sender, amount: amount, block: block-height })
-          (var-set withdrawal-counter (+ wid u1)))
-        (ok true)))))
+    (asserts! (not (var-get paused)) ERR-CONTRACT-PAUSED)
+    (let ((b (unwrap! (map-get? beneficiaries { account: tx-sender }) ERR-NOT-FOUND)))
+      (asserts! (get registered b) ERR-NOT-FOUND)
+      (let ((alloc (default-to u0 (get available (map-get? allocations { account: tx-sender })))))
+        (asserts! (<= amount alloc) ERR-INSUFFICIENT-BALANCE)
+        (asserts! (<= amount (var-get withdrawal-limit)) ERR-INVALID-AMOUNT)
+        (let ((new-alloc (unwrap! (safe-sub alloc amount) ERR-INSUFFICIENT-BALANCE))
+              (new-claimed (unwrap! (safe-add (get total-claimed b) amount) ERR-ARITHMETIC-OVERFLOW)))
+          (map-set allocations { account: tx-sender } { available: new-alloc })
+          (map-set beneficiaries { account: tx-sender } 
+                   { registered: true, 
+                     total-allocated: (get total-allocated b), 
+                     total-claimed: new-claimed })
+          (try! (stx-transfer? amount (as-contract tx-sender) tx-sender))
+          (let ((wid (var-get withdrawal-counter)))
+            (map-set withdrawal-history { id: wid } 
+                     { recipient: tx-sender, amount: amount, block: block-height })
+            (var-set withdrawal-counter (+ wid u1)))
+          (ok true))))))
 
 (define-read-only (get-beneficiary (account principal))
   (map-get? beneficiaries { account: account }))
 
 (define-read-only (get-allocation (account principal))
-  (default-to u0 (get available (map-get? allocations { account: account })) ))
+  (default-to u0 (get available (map-get? allocations { account: account }))))
 
 ;; =========================================
-;; Proposal execution routes
+;; Proposal execution functions
 ;; =========================================
 
 (define-private (exec-set-min-donation (amount uint))
-  (begin (var-set min-donation amount) (ok true)))
+  (begin 
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (var-set min-donation amount) 
+    (ok true)))
 
 (define-private (exec-set-withdrawal-limit (amount uint))
-  (begin (var-set withdrawal-limit amount) (ok true)))
+  (begin 
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (var-set withdrawal-limit amount) 
+    (ok true)))
 
-(define-private (exec-pause) (begin (var-set paused true) (ok true)))
-(define-private (exec-unpause) (begin (var-set paused false) (ok true)))
+(define-private (exec-pause) 
+  (begin 
+    (var-set paused true) 
+    (ok true)))
+
+(define-private (exec-unpause) 
+  (begin 
+    (var-set paused false) 
+    (ok true)))
 
 (define-private (exec-emergency-sweep (to principal))
   (begin
     (let ((bal (stx-get-balance (as-contract tx-sender))))
-      (asserts! (> bal u0) (err u403))
+      (asserts! (> bal u0) ERR-INSUFFICIENT-BALANCE)
       (try! (stx-transfer? bal (as-contract tx-sender) to))
       (ok true))))
 
 (define-private (execute-transaction (tx-id uint))
-  (let ((tx (unwrap! (map-get? pending-transactions { tx-id: tx-id }) (err u404))))
+  (let ((tx-data (unwrap! (map-get? pending-transactions { tx-id: tx-id }) ERR-NOT-FOUND)))
     (map-delete pending-transactions { tx-id: tx-id })
-    (let ((action (get action tx)) (params (get params tx)))
+    (let ((action (get action tx-data)) 
+          (params (get params tx-data)))
       (if (is-eq action "set-min-donation")
-        (let ((p0 (element-at params u0)))
-          (try! (exec-set-min-donation (to-uint p0)))
-          (ok true))
+        (match (element-at params u0)
+          p0 (exec-set-min-donation p0)
+          ERR-INVALID-PARAMETER)
         (if (is-eq action "set-withdrawal-limit")
-          (let ((p0 (element-at params u0)))
-            (try! (exec-set-withdrawal-limit (to-uint p0)))
-            (ok true))
+          (match (element-at params u0)
+            p0 (exec-set-withdrawal-limit p0)
+            ERR-INVALID-PARAMETER)
           (if (is-eq action "pause")
-            (begin (try! (exec-pause)) (ok true))
+            (exec-pause)
             (if (is-eq action "unpause")
-              (begin (try! (exec-unpause)) (ok true))
+              (exec-unpause)
               (if (is-eq action "emergency-sweep")
-                (let ((p0 (element-at params u0)))
-                  (try! (exec-emergency-sweep (to-principal p0)))
-                  (ok true))
-                (err u402))))))))
+                (exec-emergency-sweep (var-get admin))
+                ERR-INVALID-PARAMETER))))))))
 
 ;; =========================================
-;; Views and utilities
+;; View and utility functions
 ;; =========================================
 
 (define-read-only (get-metadata)
-  (ok { name: CONTRACT-NAME, version: CONTRACT-VERSION, purpose: CONTRACT-PURPOSE }))
+  { name: CONTRACT-NAME, version: CONTRACT-VERSION, purpose: CONTRACT-PURPOSE })
 
 (define-read-only (get-params)
-  (ok { admin: (var-get admin),
-        minDonation: (var-get min-donation),
-        withdrawalLimit: (var-get withdrawal-limit),
-        requiredSignatures: (var-get required-signatures),
-        paused: (var-get paused) }))
+  { admin: (var-get admin),
+    min-donation: (var-get min-donation),
+    withdrawal-limit: (var-get withdrawal-limit),
+    required-signatures: (var-get required-signatures),
+    paused: (var-get paused) })
 
 (define-read-only (get-stats)
-  (ok { donations: (var-get donation-counter),
-        withdrawals: (var-get withdrawal-counter),
-        balance: (stx-get-balance (as-contract tx-sender)) }))
+  { donations: (var-get donation-counter),
+    withdrawals: (var-get withdrawal-counter),
+    balance: (stx-get-balance (as-contract tx-sender)) })
 
 (define-read-only (can-beneficiary-withdraw (account principal) (amount uint))
   (let ((alloc (default-to u0 (get available (map-get? allocations { account: account })))))
-    (ok (and (<= amount alloc) (<= amount (var-get withdrawal-limit)) (not (var-get paused))))))
+    (and (<= amount alloc) 
+         (<= amount (var-get withdrawal-limit)) 
+         (not (var-get paused)))))
+         
