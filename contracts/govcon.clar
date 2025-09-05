@@ -9,8 +9,9 @@
 (define-data-var withdrawal-limit uint u1000)
 (define-data-var required-signatures uint u3)
 (define-data-var tx-nonce uint u0)
+(define-data-var paused bool false)
 
-
+;; =========================================
 ;; Maps
 ;; =========================================
 
@@ -28,6 +29,30 @@
  { recipient: principal }
  { total-withdrawn: uint })
 
+(define-map beneficiaries
+ { account: principal }
+ { registered: bool, total-allocated: uint, total-claimed: uint })
+
+(define-map allocations
+ { account: principal }
+ { available: uint })
+
+(define-map donation-history
+ { id: uint }
+ { donor: principal, amount: uint, block: uint })
+
+(define-map withdrawal-history
+ { id: uint }
+ { recipient: principal, amount: uint, block: uint })
+
+;; =========================================
+;; Counters
+;; =========================================
+
+(define-data-var donation-counter uint u0)
+(define-data-var withdrawal-counter uint u0)
+
+;; =========================================
 ;; Core functions
 ;; =========================================
 
@@ -59,8 +84,9 @@
 (define-read-only (get-admin) (ok (var-get admin)))
 (define-read-only (get-min-donation) (ok (var-get min-donation)))
 (define-read-only (get-withdrawal-limit) (ok (var-get withdrawal-limit)))
+(define-read-only (is-paused) (ok (var-get paused)))
 
-
+;; =========================================
 ;; Restrictions for disaster relief
 ;; =========================================
 
@@ -70,6 +96,23 @@
 (define-public (validate-withdrawal (amount uint))
  (if (<= amount (var-get withdrawal-limit)) (ok true) (err u405)))
 
+;; =========================================
+;; Pause control
+;; =========================================
+
+(define-public (pause)
+ (begin
+   (asserts! (is-eq tx-sender (var-get admin)) (err u401))
+   (var-set paused true)
+   (ok true)))
+
+(define-public (unpause)
+ (begin
+   (asserts! (is-eq tx-sender (var-get admin)) (err u401))
+   (var-set paused false)
+   (ok true)))
+
+;; =========================================
 ;; Multi-signature governance
 ;; =========================================
 
@@ -128,11 +171,13 @@
    (var-set required-signatures new-required)
    (ok true)))
 
+;; =========================================
 ;; Donation and withdrawal features
 ;; =========================================
 
 (define-public (donate (amount uint))
  (begin
+   (asserts! (not (var-get paused)) (err u406))
    (asserts! (>= amount (var-get min-donation)) (err u404))
    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
    (match (map-get? donations { donor: tx-sender })
@@ -140,14 +185,21 @@
        (map-set donations { donor: tx-sender }
          { total-donated: (+ amount (get total-donated donor-data)) })
      (map-set donations { donor: tx-sender } { total-donated: amount }))
+   (let ((id (var-get donation-counter)))
+     (map-set donation-history { id: id } { donor: tx-sender, amount: amount, block: block-height })
+     (var-set donation-counter (+ id u1)))
    (ok true)))
 
 (define-public (withdraw (recipient principal) (amount uint))
  (begin
+   (asserts! (not (var-get paused)) (err u406))
    (asserts! (<= amount (var-get withdrawal-limit)) (err u405))
    (let ((prev (default-to u0 (get total-withdrawn (map-get? withdrawals { recipient: recipient })))))
      (map-set withdrawals { recipient: recipient } { total-withdrawn: (+ prev amount) })
      (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+     (let ((wid (var-get withdrawal-counter)))
+       (map-set withdrawal-history { id: wid } { recipient: recipient, amount: amount, block: block-height })
+       (var-set withdrawal-counter (+ wid u1)))
      (ok true))))
 
 (define-read-only (get-donation (donor principal))
@@ -158,3 +210,52 @@
 
 (define-read-only (get-contract-balance)
  (stx-get-balance (as-contract tx-sender)))
+
+;; =========================================
+;; Beneficiaries and allocations
+;; =========================================
+
+(define-public (register-beneficiary (account principal))
+ (begin
+   (asserts! (is-eq tx-sender (var-get admin)) (err u401))
+   (match (map-get? beneficiaries { account: account })
+     b (begin (asserts! (not (get registered b)) (err u403)) (ok false))
+     (begin
+       (map-set beneficiaries { account: account } { registered: true, total-allocated: u0, total-claimed: u0 })
+       (map-set allocations { account: account } { available: u0 })
+       (ok true)))))
+
+(define-public (allocate (account principal) (amount uint))
+ (begin
+   (asserts! (is-eq tx-sender (var-get admin)) (err u401))
+   (asserts! (not (var-get paused)) (err u406))
+   (let ((b (unwrap! (map-get? beneficiaries { account: account }) (err u404))))
+     (asserts! (get registered b) (err u404))
+     (let ((alloc (default-to u0 (get available (map-get? allocations { account: account })) )))
+       (map-set allocations { account: account } { available: (+ alloc amount) })
+       (map-set beneficiaries { account: account }
+         { registered: true, total-allocated: (+ (get total-allocated b) amount), total-claimed: (get total-claimed b) })
+       (ok true)))))
+
+(define-public (beneficiary-withdraw (amount uint))
+ (begin
+   (asserts! (not (var-get paused)) (err u406))
+   (let ((b (unwrap! (map-get? beneficiaries { account: tx-sender }) (err u404))))
+     (asserts! (get registered b) (err u404))
+     (let ((alloc (default-to u0 (get available (map-get? allocations { account: tx-sender })) )))
+       (asserts! (<= amount alloc) (err u405))
+       (asserts! (<= amount (var-get withdrawal-limit)) (err u405))
+       (map-set allocations { account: tx-sender } { available: (- alloc amount) })
+       (map-set beneficiaries { account: tx-sender }
+         { registered: true, total-allocated: (get total-allocated b), total-claimed: (+ (get total-claimed b) amount) })
+       (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+       (let ((wid (var-get withdrawal-counter)))
+         (map-set withdrawal-history { id: wid } { recipient: tx-sender, amount: amount, block: block-height })
+         (var-set withdrawal-counter (+ wid u1)))
+       (ok true)))))
+
+(define-read-only (get-beneficiary (account principal))
+ (map-get? beneficiaries { account: account }))
+
+(define-read-only (get-allocation (account principal))
+ (default-to u0 (get available (map-get? allocations { account: account }))))
